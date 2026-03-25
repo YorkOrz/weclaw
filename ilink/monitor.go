@@ -84,11 +84,13 @@ func (m *Monitor) Run(ctx context.Context) error {
 		m.failures = 0
 		m.lastActivity = time.Now()
 
-		// Session expired — reset sync buf and reconnect
+		// Session expired — reset sync buf and reconnect silently
 		if resp.ErrCode == errCodeSessionExpired {
-			log.Printf("[monitor] session expired, resetting sync buf and reconnecting in %s", sessionExpiredBackoff)
-			m.getUpdatesBuf = ""
-			m.saveBuf()
+			if m.getUpdatesBuf != "" {
+				log.Printf("[monitor] session expired, resetting sync buf")
+				m.getUpdatesBuf = ""
+				m.saveBuf()
+			}
 			select {
 			case <-time.After(sessionExpiredBackoff):
 			case <-ctx.Done():
