@@ -56,10 +56,22 @@ func NewCLIAgent(cfg CLIAgentConfig) *CLIAgent {
 
 // streamEvent represents a single event from claude's stream-json output.
 type streamEvent struct {
-	Type      string `json:"type"`
-	SessionID string `json:"session_id"`
-	Result    string `json:"result"`
-	IsError   bool   `json:"is_error"`
+	Type      string         `json:"type"`
+	SessionID string         `json:"session_id"`
+	Result    string         `json:"result"`
+	IsError   bool           `json:"is_error"`
+	Message   *streamMessage `json:"message,omitempty"`
+}
+
+// streamMessage represents the message field in an assistant event.
+type streamMessage struct {
+	Content []streamContent `json:"content"`
+}
+
+// streamContent represents a content block in an assistant message.
+type streamContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 // Info returns metadata about this agent.
@@ -153,6 +165,7 @@ func (a *CLIAgent) chatClaude(ctx context.Context, conversationID string, messag
 	// Parse streaming JSON events
 	var result string
 	var newSessionID string
+	var assistantTexts []string
 
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB buffer for large responses
@@ -173,13 +186,28 @@ func (a *CLIAgent) chatClaude(ctx context.Context, conversationID string, messag
 			newSessionID = event.SessionID
 		}
 
-		// The "result" event contains the final text
-		if event.Type == "result" {
+		switch event.Type {
+		case "result":
 			if event.IsError {
 				return "", fmt.Errorf("%s returned error: %s", a.name, event.Result)
 			}
 			result = event.Result
+		case "assistant":
+			// Newer claude CLI versions send text in assistant events
+			// instead of the result event's result field.
+			if event.Message != nil {
+				for _, c := range event.Message.Content {
+					if c.Type == "text" && c.Text != "" {
+						assistantTexts = append(assistantTexts, c.Text)
+					}
+				}
+			}
 		}
+	}
+
+	// If the result event had an empty result, fall back to accumulated assistant texts.
+	if result == "" && len(assistantTexts) > 0 {
+		result = strings.Join(assistantTexts, "")
 	}
 
 	if err := cmd.Wait(); err != nil {
