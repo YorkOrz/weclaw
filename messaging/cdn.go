@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/fastclaw-ai/weclaw/ilink"
@@ -76,8 +77,17 @@ func UploadFileToCDN(ctx context.Context, client *ilink.Client, data []byte, toU
 		return nil, fmt.Errorf("encrypt: %w", err)
 	}
 
-	// Upload to CDN
-	downloadParam, err := uploadToCDN(ctx, encrypted, uploadResp.UploadParam, filekeyHex)
+	// Upload to CDN: prefer server-provided full URL, fall back to param-based construction
+	cdnURL := strings.TrimSpace(uploadResp.UploadFullURL)
+	if cdnURL == "" {
+		if uploadResp.UploadParam == "" {
+			return nil, fmt.Errorf("getuploadurl returned no upload URL (need upload_full_url or upload_param)")
+		}
+		cdnURL = fmt.Sprintf("%s/upload?encrypted_query_param=%s&filekey=%s",
+			cdnBaseURL, url.QueryEscape(uploadResp.UploadParam), url.QueryEscape(filekeyHex))
+	}
+
+	downloadParam, err := uploadToCDN(ctx, encrypted, cdnURL)
 	if err != nil {
 		return nil, fmt.Errorf("CDN upload: %w", err)
 	}
@@ -166,10 +176,7 @@ func decryptAESECB(ciphertext, key []byte) ([]byte, error) {
 	return plaintext[:len(plaintext)-padLen], nil
 }
 
-func uploadToCDN(ctx context.Context, encrypted []byte, uploadParam, filekey string) (string, error) {
-	cdnURL := fmt.Sprintf("%s/upload?encrypted_query_param=%s&filekey=%s",
-		cdnBaseURL, url.QueryEscape(uploadParam), url.QueryEscape(filekey))
-
+func uploadToCDN(ctx context.Context, encrypted []byte, cdnURL string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cdnURL, bytes.NewReader(encrypted))
 	if err != nil {
 		return "", err
@@ -221,5 +228,5 @@ func encryptAESECB(plaintext, key []byte) ([]byte, error) {
 }
 
 func aesECBPaddedSize(plaintextSize int) int {
-	return ((plaintextSize + 1) / aes.BlockSize + 1) * aes.BlockSize
+	return (plaintextSize/aes.BlockSize + 1) * aes.BlockSize
 }

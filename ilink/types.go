@@ -112,9 +112,10 @@ type GetUploadURLRequest struct {
 
 // GetUploadURLResponse is the response from getuploadurl.
 type GetUploadURLResponse struct {
-	Ret         int    `json:"ret"`
-	ErrMsg      string `json:"errmsg,omitempty"`
-	UploadParam string `json:"upload_param"`
+	Ret           int    `json:"ret"`
+	ErrMsg        string `json:"errmsg,omitempty"`
+	UploadParam   string `json:"upload_param"`
+	UploadFullURL string `json:"upload_full_url,omitempty"`
 }
 
 // TextItem holds text content.
