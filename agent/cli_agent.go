@@ -3,11 +3,13 @@ package agent
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -91,6 +93,9 @@ func (a *CLIAgent) ResetSession(_ context.Context, conversationID string) (strin
 	a.mu.Lock()
 	delete(a.sessions, conversationID)
 	a.mu.Unlock()
+	if err := os.Remove(a.sessionPath(conversationID)); err != nil && !os.IsNotExist(err) {
+		log.Printf("[cli] failed to remove session file (command=%s, conversation=%s): %v", a.command, conversationID, err)
+	}
 	log.Printf("[cli] session reset (command=%s, conversation=%s)", a.command, conversationID)
 	return "", nil
 }
@@ -106,7 +111,7 @@ func (a *CLIAgent) SetCwd(cwd string) {
 func (a *CLIAgent) Chat(ctx context.Context, conversationID string, message string) (string, error) {
 	switch a.name {
 	case "codex":
-		return a.chatCodex(ctx, message)
+		return a.chatCodex(ctx, conversationID, message)
 	default:
 		return a.chatClaude(ctx, conversationID, message)
 	}
@@ -129,6 +134,17 @@ func (a *CLIAgent) chatClaude(ctx context.Context, conversationID string, messag
 	a.mu.Lock()
 	sessionID, hasSession := a.sessions[conversationID]
 	a.mu.Unlock()
+	if !hasSession {
+		if loadedSessionID, ok := a.loadSession(conversationID); ok {
+			sessionID = loadedSessionID
+			hasSession = true
+			a.mu.Lock()
+			a.sessions[conversationID] = sessionID
+			a.mu.Unlock()
+		} else {
+			log.Printf("[cli] no persisted session found (agent=%s, conversation=%s, path=%s)", a.name, conversationID, a.sessionPath(conversationID))
+		}
+	}
 
 	if hasSession {
 		args = append(args, "--resume", sessionID)
@@ -239,16 +255,56 @@ func (a *CLIAgent) chatClaude(ctx context.Context, conversationID string, messag
 	return result, nil
 }
 
-// chatCodex handles codex CLI invocation using "codex exec".
-func (a *CLIAgent) chatCodex(ctx context.Context, message string) (string, error) {
-	args := []string{"exec", message}
-	if a.model != "" {
-		args = append(args, "--model", a.model)
-	}
-	// Append extra args from config (e.g. --skip-git-repo-check)
-	args = append(args, a.args...)
+type codexJSONEvent struct {
+	Type     string `json:"type"`
+	ThreadID string `json:"thread_id"`
+	Item     *struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"item,omitempty"`
+}
 
-	log.Printf("[cli] running codex exec (command=%s)", a.command)
+// chatCodex handles codex CLI invocation using "codex exec" and persists
+// thread IDs per WeChat conversation for multi-turn context.
+func (a *CLIAgent) chatCodex(ctx context.Context, conversationID string, message string) (string, error) {
+	outFile := filepath.Join(os.TempDir(), fmt.Sprintf("weclaw-codex-%d.txt", os.Getpid()))
+	_ = os.Remove(outFile)
+	defer os.Remove(outFile)
+
+	a.mu.Lock()
+	sessionID, hasSession := a.sessions[conversationID]
+	a.mu.Unlock()
+	if !hasSession {
+		if loadedSessionID, ok := a.loadSession(conversationID); ok {
+			sessionID = loadedSessionID
+			hasSession = true
+			a.mu.Lock()
+			a.sessions[conversationID] = sessionID
+			a.mu.Unlock()
+		} else {
+			log.Printf("[cli] no persisted codex thread found (agent=%s, conversation=%s, path=%s)", a.name, conversationID, a.sessionPath(conversationID))
+		}
+	}
+
+	var args []string
+	if hasSession {
+		args = []string{"exec", "resume", "--json", "--output-last-message", outFile}
+		if a.model != "" {
+			args = append(args, "--model", a.model)
+		}
+		args = append(args, filterCodexResumeArgs(a.args)...)
+		args = append(args, sessionID, message)
+		log.Printf("[cli] resuming codex thread (command=%s, thread=%s, conversation=%s)", a.command, sessionID, conversationID)
+	} else {
+		args = []string{"exec", "--json", "--output-last-message", outFile}
+		if a.model != "" {
+			args = append(args, "--model", a.model)
+		}
+		args = append(args, a.args...)
+		args = append(args, message)
+		log.Printf("[cli] starting new codex thread (command=%s, conversation=%s)", a.command, conversationID)
+	}
+
 	cmd := exec.CommandContext(ctx, a.command, args...)
 	if a.cwd != "" {
 		cmd.Dir = a.cwd
@@ -263,7 +319,37 @@ func (a *CLIAgent) chatCodex(ctx context.Context, message string) (string, error
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 
-	out, err := cmd.Output()
+	stdout, pipeErr := cmd.StdoutPipe()
+	if pipeErr != nil {
+		return "", fmt.Errorf("create codex stdout pipe: %w", pipeErr)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("start codex: %w", err)
+	}
+
+	var threadID string
+	var fallbackTexts []string
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		var event codexJSONEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			continue
+		}
+		if event.ThreadID != "" {
+			threadID = event.ThreadID
+		}
+		if event.Type == "item.completed" && event.Item != nil && event.Item.Type == "agent_message" && event.Item.Text != "" {
+			fallbackTexts = append(fallbackTexts, event.Item.Text)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("[cli] codex stdout scan error: %v", err)
+	}
+
+	err := cmd.Wait()
 	if err != nil {
 		errMsg := strings.TrimSpace(stderr.String())
 		if errMsg != "" {
@@ -272,9 +358,115 @@ func (a *CLIAgent) chatCodex(ctx context.Context, message string) (string, error
 		return "", fmt.Errorf("codex error: %w", err)
 	}
 
-	result := strings.TrimSpace(string(out))
+	if threadID != "" {
+		a.mu.Lock()
+		a.sessions[conversationID] = threadID
+		a.mu.Unlock()
+		sessionPath, err := a.saveSession(conversationID, threadID)
+		if err != nil {
+			log.Printf("[cli] failed to persist codex thread (thread=%s, conversation=%s): %v", threadID, conversationID, err)
+		} else {
+			log.Printf("[cli] persisted codex thread (thread=%s, conversation=%s, path=%s)", threadID, conversationID, sessionPath)
+		}
+		log.Printf("[cli] saved codex thread (thread=%s, conversation=%s)", threadID, conversationID)
+	}
+
+	var result string
+	if data, readErr := os.ReadFile(outFile); readErr == nil && len(data) > 0 {
+		result = string(data)
+	} else if len(fallbackTexts) > 0 {
+		result = strings.Join(fallbackTexts, "")
+	}
+	result = strings.TrimSpace(result)
 	if result == "" {
 		return "", fmt.Errorf("codex returned empty response")
 	}
 	return result, nil
+}
+
+type persistedCLISession struct {
+	Agent          string `json:"agent"`
+	Command        string `json:"command"`
+	ConversationID string `json:"conversation_id"`
+	SessionID      string `json:"session_id"`
+}
+
+func (a *CLIAgent) sessionPath(conversationID string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "weclaw-sessions", a.sessionFileName(conversationID))
+	}
+	return filepath.Join(home, ".weclaw", "sessions", a.sessionFileName(conversationID))
+}
+
+func (a *CLIAgent) sessionFileName(conversationID string) string {
+	sum := sha256.Sum256([]byte(a.name + "\x00" + conversationID))
+	return fmt.Sprintf("%s-%x.json", safeSessionName(a.name), sum[:12])
+}
+
+func safeSessionName(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "agent"
+	}
+	return b.String()
+}
+
+func (a *CLIAgent) loadSession(conversationID string) (string, bool) {
+	path := a.sessionPath(conversationID)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	var s persistedCLISession
+	if err := json.Unmarshal(data, &s); err != nil {
+		log.Printf("[cli] failed to parse session file (command=%s, conversation=%s): %v", a.command, conversationID, err)
+		return "", false
+	}
+	if s.SessionID == "" {
+		return "", false
+	}
+	log.Printf("[cli] loaded persisted session (agent=%s, session=%s, conversation=%s, path=%s)", a.name, s.SessionID, conversationID, path)
+	return s.SessionID, true
+}
+
+func (a *CLIAgent) saveSession(conversationID, sessionID string) (string, error) {
+	path := a.sessionPath(conversationID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return path, err
+	}
+	data, err := json.MarshalIndent(persistedCLISession{
+		Agent:          a.name,
+		Command:        a.command,
+		ConversationID: conversationID,
+		SessionID:      sessionID,
+	}, "", "  ")
+	if err != nil {
+		return path, err
+	}
+	return path, os.WriteFile(path, data, 0o600)
+}
+
+func filterCodexResumeArgs(args []string) []string {
+	filtered := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--sandbox", "-s":
+			if i+1 < len(args) {
+				i++
+			}
+		case "--cd", "-C", "--add-dir":
+			if i+1 < len(args) {
+				i++
+			}
+		default:
+			filtered = append(filtered, args[i])
+		}
+	}
+	return filtered
 }

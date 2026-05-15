@@ -79,7 +79,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	if config.DetectAndConfigure(cfg) {
+	if os.Getenv("WECLAW_DISABLE_AUTODETECT") != "1" && config.DetectAndConfigure(cfg) {
 		if err := config.Save(cfg); err != nil {
 			log.Printf("Warning: failed to save auto-detected config: %v", err)
 		} else {
